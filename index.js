@@ -30,12 +30,25 @@ function verifyHmac(req) {
   catch { return false; }
 }
 function formatWhaleAlert(payload) {
-  const base = payload.transaction || payload || {};
+  // — Trouve le bon objet transaction peu importe l'enrobage —
+  // payload peut être: {transaction}, {exemples: [...]}, {data:{transactions:[...]}}
+  // ou même directement un tableau [tx, tx, ...]
+  let root = payload && (payload.transaction || payload.payload || payload);
+
+  // si c'est un wrapper connu, on descend d'un niveau
+  if (root && root.exemples && Array.isArray(root.exemples)) root = root.exemples[0];
+  else if (root && root.data && Array.isArray(root.data.transactions)) root = root.data.transactions[0];
+  else if (root && root.transactions && Array.isArray(root.transactions)) root = root.transactions[0];
+
+  // si c'est un tableau direct, on prend le 1er élément
+  const base = Array.isArray(root) ? root[0] : (root || {});
+
   const chain =
     base.blockchain ||
     base.network ||
     (base.currency && base.currency.blockchain) ||
     "unknown";
+
   const ts = Number(base.timestamp || base.time || Date.now() / 1000);
   const dt = new Date(ts * 1000).toISOString();
 
