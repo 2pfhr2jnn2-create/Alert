@@ -1,6 +1,6 @@
 import express from "express";
-import crypto from "crypto";
 import axios from "axios";
+import crypto from "crypto";
 import helmet from "helmet";
 import morgan from "morgan";
 
@@ -14,7 +14,7 @@ const {
   DEFAULT_CHAT_ID,
   ABSOLUTE_SILENCE = "true",
   HMAC_SECRET,
-  ALLOW_CHAT_IDS
+  ALLOW_CHAT_IDS,
 } = process.env;
 
 const tgBase = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
@@ -22,26 +22,26 @@ const allowSet = new Set((ALLOW_CHAT_IDS || "").split(",").filter(Boolean));
 const seen = new Set();
 
 function verifyHmac(req) {
-  if (!HMAC_SECRET) return true; // si non défini, on laisse passer (pour tests)
+  if (!HMAC_SECRET) return true; // désactivé si pas de clé
   const sig = req.get("X-Signature") || "";
   const body = JSON.stringify(req.body || {});
   const h = crypto.createHmac("sha256", HMAC_SECRET).update(body).digest("hex");
-  try { return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(h)); }
-  catch { return false; }
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(h));
+  } catch {
+    return false;
+  }
 }
+
 function formatWhaleAlert(payload) {
-  // — Trouve le bon objet transaction peu importe l'enrobage —
-  // payload peut être: {transaction}, {exemples: [...]}, {data:{transactions:[...]}}
-  // ou même directement un tableau [tx, tx, ...]
+  // — Tolérant à toutes les structures de Whale Alert —
   let root = payload && (payload.transaction || payload.payload || payload);
-
-  // si c'est un wrapper connu, on descend d'un niveau
   if (root && root.exemples && Array.isArray(root.exemples)) root = root.exemples[0];
-  else if (root && root.data && Array.isArray(root.data.transactions)) root = root.data.transactions[0];
-  else if (root && root.transactions && Array.isArray(root.transactions)) root = root.transactions[0];
-
-  // si c'est un tableau direct, on prend le 1er élément
-  const base = Array.isArray(root) ? root[0] : (root || {});
+  else if (root && root.data && Array.isArray(root.data.transactions))
+    root = root.data.transactions[0];
+  else if (root && root.transactions && Array.isArray(root.transactions))
+    root = root.transactions[0];
+  const base = Array.isArray(root) ? root[0] : root || {};
 
   const chain =
     base.blockchain ||
@@ -121,13 +121,16 @@ function formatWhaleAlert(payload) {
 
   return { title, body };
 }
+
 app.post("/ingest", async (req, res) => {
   try {
-    if (!verifyHmac(req)) return res.status(401).json({ ok: false, error: "bad signature" });
+    if (!verifyHmac(req))
+      return res.status(401).json({ ok: false, error: "bad signature" });
 
-    const { source = "unknown", type = "whale", chat_id, idempotency_key, payload } = req.body || {};
+    const { source = "unknown", type = "whale", chat_id, payload } = req.body || {};
 
-    const key = idempotency_key || crypto.createHash("md5").update(JSON.stringify(req.body)).digest("hex");
+    const key =
+      crypto.createHash("md5").update(JSON.stringify(req.body)).digest("hex");
     if (seen.has(key)) return res.json({ ok: true, dedup: true });
     seen.add(key);
     setTimeout(() => seen.delete(key), 5 * 60 * 1000);
@@ -140,31 +143,35 @@ app.post("/ingest", async (req, res) => {
     let msg = "";
     if (type === "whale") {
       const { title, body } = formatWhaleAlert(payload || {});
-      msg = `*${title}*\n${body}`;
-    } else if (type === "xau") {
+      msg = `${title}\n${body}`;
+    } else if (type === "xauusd") {
       const { price, change, source_name } = payload || {};
-      msg = `🪙 XAU/USD: *${price}* (${change >= 0 ? "▲" : "▼"} ${change}%)\n_source: ${source_name || "feed"}_`;
+      msg = `🪙 Gold Alert\nPrix: $${price}\nChangement: ${change}%\nSource: ${source_name}`;
     } else {
       msg = "Nouvelle alerte.";
     }
 
-    const disableNotif = String(ABSOLUTE_SILENCE).toLowerCase() === "true";
+    if (ABSOLUTE_SILENCE === "true") {
+      await axios.post(`${tgBase}/sendMessage`, {
+        chat_id: targetChat,
+        text: msg,
+        disable_notification: true,
+      });
+    } else {
+      await axios.post(`${tgBase}/sendMessage`, {
+        chat_id: targetChat,
+        text: msg,
+      });
+    }
 
-    const r = await axios.post(`${tgBase}/sendMessage`, {
-      chat_id: targetChat,
-      text: msg,
-      parse_mode: "Markdown",
-      disable_web_page_preview: true,
-      disable_notification: disableNotif
-    });
-
-    return res.json({ ok: true, telegram: r.data });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ ok: false, error: e.message });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Erreur /ingest:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-app.get("/", (_req, res) => res.send("OK"));
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("relay up on", port));
+const port = process.env.PORT || 10000;
+app.listen(port, () => {
+  console.log(`⚡ WhaleAlert bot actif sur port ${port}`);
+});
