@@ -29,7 +29,6 @@ function verifyHmac(req) {
   try { return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(h)); }
   catch { return false; }
 }
-
 function formatWhaleAlert(payload) {
   const base = payload.transaction || payload || {};
   const chain =
@@ -84,9 +83,7 @@ function formatWhaleAlert(payload) {
     ) || Number(base.amount_usd || base.value_usd || 0) || 0;
 
   const amountsLine = subs.length
-    ? subs
-        .map((s) => `${(s.symbol || "").toUpperCase()} ${s.amount ?? "?"}`)
-        .join(", ")
+    ? subs.map((s) => `${(s.symbol || "").toUpperCase()} ${s.amount ?? "?"}`).join(", ")
     : "?";
 
   const from =
@@ -111,7 +108,6 @@ function formatWhaleAlert(payload) {
 
   return { title, body };
 }
-
 app.post("/ingest", async (req, res) => {
   try {
     if (!verifyHmac(req)) return res.status(401).json({ ok: false, error: "bad signature" });
