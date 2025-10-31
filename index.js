@@ -31,25 +31,85 @@ function verifyHmac(req) {
 }
 
 function formatWhaleAlert(payload) {
-  const p = payload.transaction || payload;
-  const chain = p.blockchain || payload.blockchain || "blockchain";
-  const ts = p.timestamp || payload.timestamp;
-  const dt = ts ? new Date(ts * 1000).toISOString() : new Date().toISOString();
-  const sub = p.sub_transactions || [];
-  const amounts = sub.map(s => `${(s.symbol||"").toUpperCase()} ${s.amount||"?"}`).join(", ");
-  const from = sub?.[0]?.inputs?.[0]?.owner || payload.from || "unknown";
-  const to = sub?.[0]?.outputs?.[0]?.owner || payload.to || "unknown";
-  const valueUSD = sub.reduce((acc, s) => acc + (Number(s.unit_price_usd||0) * Number(s.amount||0)), 0) || payload.min_value_usd;
+  const base = payload.transaction || payload || {};
+  const chain =
+    base.blockchain ||
+    base.network ||
+    (base.currency && base.currency.blockchain) ||
+    "unknown";
+  const ts = Number(base.timestamp || base.time || Date.now() / 1000);
+  const dt = new Date(ts * 1000).toISOString();
 
-  return {
-    title: `🐋 Whale Alert`,
-    body:
-`• Réseau: ${chain}
+  let subs = Array.isArray(base.sub_transactions) ? base.sub_transactions : [];
+
+  if (!subs.length) {
+    const symbol = (base.symbol || base.currency || base.ticker || "").toLowerCase();
+    const amount = Number(base.amount || base.volume || 0);
+    const amountUsd = Number(base.amount_usd || base.value_usd || base.usd || 0);
+    const unit_price_usd = amount ? amountUsd / amount : undefined;
+
+    const fromOwner =
+      base.from?.owner ||
+      base.from_owner ||
+      base.from?.address ||
+      base.inputs?.[0]?.owner ||
+      base.inputs?.[0]?.address ||
+      "unknown";
+
+    const toOwner =
+      base.to?.owner ||
+      base.to_owner ||
+      base.to?.address ||
+      base.outputs?.[0]?.owner ||
+      base.outputs?.[0]?.address ||
+      "unknown";
+
+    if (symbol || amount) {
+      subs = [
+        {
+          symbol,
+          amount,
+          unit_price_usd,
+          inputs: [{ owner: fromOwner }],
+          outputs: [{ owner: toOwner }],
+        },
+      ];
+    }
+  }
+
+  const valueUSD =
+    subs.reduce(
+      (acc, s) => acc + (Number(s.unit_price_usd || 0) * Number(s.amount || 0)),
+      0
+    ) || Number(base.amount_usd || base.value_usd || 0) || 0;
+
+  const amountsLine = subs.length
+    ? subs
+        .map((s) => `${(s.symbol || "").toUpperCase()} ${s.amount ?? "?"}`)
+        .join(", ")
+    : "?";
+
+  const from =
+    subs?.[0]?.inputs?.[0]?.owner ||
+    base.from?.owner ||
+    base.from_owner ||
+    base.from?.address ||
+    "unknown";
+  const to =
+    subs?.[0]?.outputs?.[0]?.owner ||
+    base.to?.owner ||
+    base.to_owner ||
+    base.to?.address ||
+    "unknown";
+
+  const title = `🐋 Whale Alert`;
+  const body = `• Réseau: ${chain}
 • De → À: ${from} → ${to}
-• Montants: ${amounts||"?"}
+• Montants: ${amountsLine}
 • Valeur ~$${valueUSD ? Math.round(valueUSD).toLocaleString("en-US") : "?"}
-• Date: ${dt}`
-  };
+• Date: ${dt}`;
+
+  return { title, body };
 }
 
 app.post("/ingest", async (req, res) => {
