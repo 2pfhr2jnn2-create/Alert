@@ -1,11 +1,14 @@
+// index.js — Render Web Service (Node 20+)
 import express from "express";
-import axios from "axios";
-import crypto from "crypto";
 import helmet from "helmet";
 import morgan from "morgan";
+import crypto from "crypto";
 
+/* =========================
+   Config & boot
+========================= */
 const app = express();
-app.use(express.json({ limit: "512kb" }));
+app.use(express.json({ limit: "5mb" }));
 app.use(helmet());
 app.use(morgan("tiny"));
 
@@ -14,109 +17,214 @@ const {
   DEFAULT_CHAT_ID,
   ABSOLUTE_SILENCE = "true",
   HMAC_SECRET,
-  ALLOW_CHAT_IDS,
-  DEBUG_LOG = "false",
-  DEBUG_ECHO = "false",
+  ALLOW_CHAT_IDS,            // ex: "12345,67890"
+  DEBUG_LOG = "false",       // "true" pour voir les logs request
+  DEBUG_ECHO = "false",      // "true" pour envoyer l'écho JSON
+  PORT = 10000,
 } = process.env;
 
 const tgBase = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const allowSet = new Set((ALLOW_CHAT_IDS || "").split(",").map(s => s.trim()).filter(Boolean));
 const seen = new Set();
 
-// HMAC
+/* =========================
+   Utils
+========================= */
+const escapeHtml = (str = "") =>
+  String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+const shortAddr = (s) => {
+  if (!s) return "unknown";
+  const ss = String(s);
+  return ss.length > 16 ? `${ss.slice(0, 6)}…${ss.slice(-6)}` : ss;
+};
+
+const EX_LABELS = [
+  { rx: /(okx|okex)/i,         label: "OKX" },
+  { rx: /binance/i,            label: "Binance" },
+  { rx: /coinbase/i,           label: "Coinbase" },
+  { rx: /kraken/i,             label: "Kraken" },
+  { rx: /bitfinex/i,           label: "Bitfinex" },
+  { rx: /bybit/i,              label: "Bybit" },
+  { rx: /huobi|htx/i,          label: "HTX" },
+  { rx: /kucoin/i,             label: "KuCoin" },
+  { rx: /bitstamp/i,           label: "Bitstamp" },
+  { rx: /mexc/i,               label: "MEXC" },
+  { rx: /gate(\.io)?/i,        label: "Gate.io" },
+  { rx: /gemini/i,             label: "Gemini" },
+  { rx: /poloniex/i,           label: "Poloniex" },
+  { rx: /bitget/i,             label: "Bitget" },
+];
+
+const normalizeExchange = (str) => {
+  if (!str) return null;
+  for (const { rx, label } of EX_LABELS) if (rx.test(String(str))) return label;
+  return null;
+};
+
+const pickSideLabel = (side = {}) => {
+  const owner = side.owner || side.owner_type;
+  if (owner && String(owner).toLowerCase() !== "unknown") {
+    return normalizeExchange(owner) || String(owner);
+  }
+  const candidates = [
+    side.address, side.addr, side.account,
+    side?.inputs?.[0]?.address,
+    side?.outputs?.[0]?.address,
+  ].filter(Boolean);
+  return candidates.length ? shortAddr(candidates[0]) : "unknown";
+};
+
 function verifyHmac(req) {
-  if (!HMAC_SECRET) return true;
+  if (!HMAC_SECRET) return true; // HMAC optionnel (utile pour tests)
   const sig = req.get("X-Signature") || "";
   const body = JSON.stringify(req.body || {});
-  const h = crypto.createHmac("sha256", HMAC_SECRET).update(body).digest("hex");
-  try { return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(h)); }
-  catch { return false; }
+  try {
+    const h = crypto.createHmac("sha256", HMAC_SECRET).update(body).digest("hex");
+    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(h));
+  } catch {
+    return false;
+  }
 }
 
-// utils
-const short = s => (!s ? "unknown" : String(s).length > 16 ? `${String(s).slice(0,6)}…${String(s).slice(-6)}` : String(s));
-const niceN = (n, maxFrac=6) => Number(n ?? 0).toLocaleString("en-US", { maximumFractionDigits: maxFrac });
-
-// formatter whale alert
-function formatWhaleAlert(tx) {
-  const safe = (s) => (!s ? "unknown" :
-    s.length > 16 ? `${s.slice(0,6)}…${s.slice(-6)}` : s);
-
-  const pick = (side={}) => {
-    if (side.owner && side.owner.toLowerCase() !== "unknown") return side.owner;
-    const cands = [
-      side.address, side.addr, side.account,
-      side?.inputs?.[0]?.address,
-      side?.outputs?.[0]?.address,
-    ].filter(Boolean);
-    return cands.length ? safe(cands[0]) : "unknown";
+async function sendTelegram(chat_id, text) {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  const payload = {
+    chat_id,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    disable_notification: (ABSOLUTE_SILENCE || "true").toLowerCase() === "true",
   };
-
-  const from = pick(tx.from);
-  const to = pick(tx.to);
-  const coin = (tx.symbol || tx.currency || "?").toUpperCase();
-  const amount = Number(tx.amount_usd || tx.value_usd || 0);
-  const value = amount ? `$${Math.round(amount).toLocaleString()}` : "?";
-
-  return {
-    title: "🐋 Whale Alert",
-    body: `• Coin: ${coin}\n• From → To: ${from} → ${to}\n• Value: ${value}`,
-  };
+  const res = await fetch(`${tgBase}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    if (DEBUG_LOG === "true") console.error("TG error:", t);
+  }
 }
-// healthchecks
+
+/* =========================
+   Whale Alert → Bold & Clean
+========================= */
+function formatWhaleAlert(tx = {}) {
+  const coin =
+    (tx.symbol || tx.currency || tx.asset || tx.ticker || "?").toUpperCase();
+  const network =
+    tx.blockchain || tx.network || (tx.currency && tx.currency.blockchain) || "unknown";
+
+  const ts = Number(tx.timestamp || tx.time || Date.now() / 1000);
+  const dtIso = new Date(ts * 1000).toISOString();
+
+  // Valeur USD si fournie, sinon essaie (amount * unit_price_usd)
+  let valueUSD = Number(tx.amount_usd || tx.value_usd || tx.usd_value || 0);
+  if (!valueUSD) {
+    const amt = Number(
+      tx.amount ?? tx.quantity ?? tx.volume ?? tx.size ??
+      (Array.isArray(tx.amounts) && tx.amounts[0]?.amount) ?? 0
+    );
+    const unit = Number(tx.unit_price_usd || 0);
+    if (amt && unit) valueUSD = unit * amt;
+  }
+
+  // Montant coin si dispo
+  const amountCoin = Number(
+    tx.amount ?? tx.quantity ?? tx.volume ?? tx.size ??
+    (Array.isArray(tx.amounts) && tx.amounts[0]?.amount) ?? 0
+  );
+  const amountLine = amountCoin
+    ? `${coin} ${amountCoin.toLocaleString("en-US", { maximumFractionDigits: 6 })}`
+    : "?";
+
+  const fromLabel = pickSideLabel(tx.from);
+  const toLabel   = pickSideLabel(tx.to);
+  const fromEx = normalizeExchange(fromLabel);
+  const toEx   = normalizeExchange(toLabel);
+  const isInternal = fromEx && toEx && fromEx === toEx;
+
+  const valueLine = valueUSD
+    ? `~$${Math.round(valueUSD).toLocaleString("en-US")}`
+    : "~$?";
+
+  // ——— Message TELEGRAM “Bold & Clean” (HTML) ———
+  const title = `🐋 <b>${escapeHtml(coin)} Whale</b>`;
+  const body =
+    `💵 <b>Valeur</b> : ${escapeHtml(valueLine)}${isInternal ? " <i>(interne)</i>" : ""}\n` +
+    `🔗 <b>Réseau</b> : ${escapeHtml(network)}\n` +
+    `🏦 <b>De → À</b> : ${escapeHtml(fromLabel)} → ${escapeHtml(toLabel)}\n` +
+    `📊 <b>Montant</b> : ${escapeHtml(amountLine)}\n` +
+    `🕒 <b>Date</b> : ${escapeHtml(dtIso)}`;
+
+  return { title, body };
+}
+
+/* =========================
+   Routes
+========================= */
 app.get("/", (_req, res) => res.send("OK"));
-app.get("/ingest", (_req, res) => res.send("Ingest OK — utilisez POST pour envoyer une alerte."));
+app.get("/ingest", (_req, res) =>
+  res.send("Ingest OK – utilisez POST pour envoyer une alerte.")
+);
 
-// ingestion
 app.post("/ingest", async (req, res) => {
   try {
-    if (DEBUG_LOG === "true") console.log("INGEST BODY:", JSON.stringify(req.body).slice(0,800));
-    if (!verifyHmac(req)) return res.status(401).json({ ok:false, error:"bad signature" });
+    if (DEBUG_LOG === "true") {
+      console.log("INGEST BODY:", JSON.stringify(req.body).slice(0, 1200));
+    }
+    if (!verifyHmac(req)) return res.status(401).json({ ok: false, error: "bad signature" });
 
     const { type = "whale", chat_id, idempotency_key, payload, text } = req.body || {};
 
-    // anti-dup 5 min
+    // anti-doublon 5 min
     const key = idempotency_key || crypto.createHash("md5").update(JSON.stringify(req.body)).digest("hex");
-    if (seen.has(key)) return res.json({ ok:true, dedup:true });
-    seen.add(key); setTimeout(() => seen.delete(key), 5*60*1000);
+    if (seen.has(key)) return res.json({ ok: true, dedup: true });
+    seen.add(key);
+    setTimeout(() => seen.delete(key), 5 * 60 * 1000);
 
+    // chat autorisé
     const targetChat = String(chat_id || DEFAULT_CHAT_ID || "");
     if (!targetChat) return res.status(400).json({ ok:false, error:"missing chat id" });
-    if (allowSet.size && !allowSet.has(targetChat)) return res.status(403).json({ ok:false, error:"chat not allowed" });
+    if (allowSet.size && !allowSet.has(targetChat)) {
+      return res.status(403).json({ ok:false, error:"chat not allowed" });
+    }
 
-    let msg = "Nouvelle alerte.";
+    // composition du message
+    let msg = "";
     if (type === "whale") {
       const { title, body } = formatWhaleAlert(payload || {});
       msg = `${title}\n${body}`;
     } else if (type === "digest") {
-      // message déjà formatté côté Pipedream (texte libre)
-      msg = text || "Résumé quotidien";
+      // texte déjà formaté côté Pipedream
+      msg = escapeHtml(text || "Digest");
+    } else {
+      msg = escapeHtml(text || "Nouvelle alerte.");
     }
 
-    if (DEBUG_ECHO === "true") {
-      const preview = JSON.stringify(payload || {}, null, 2).slice(0, 700);
-      await axios.post(`${tgBase}/sendMessage`, {
-        chat_id: targetChat,
-        text: `🔎 DEBUG_ECHO\n${preview}`,
-        disable_web_page_preview: true,
-        disable_notification: String(ABSOLUTE_SILENCE).toLowerCase() === "true",
-      });
+    // envoi Telegram
+    await sendTelegram(targetChat, msg);
+
+    // (optionnel) écho debug
+    if ((DEBUG_ECHO || "").toLowerCase() === "true" && type === "whale") {
+      const pretty = "<code>" + escapeHtml(JSON.stringify(payload || {}, null, 2)).slice(0, 3800) + "</code>";
+      await sendTelegram(targetChat, `🔎 <b>DEBUG_ECHO</b>\n${pretty}`);
     }
 
-    await axios.post(`${tgBase}/sendMessage`, {
-      chat_id: targetChat,
-      text: msg,
-      parse_mode: "Markdown",
-      disable_web_page_preview: true,
-      disable_notification: String(ABSOLUTE_SILENCE).toLowerCase() === "true",
-    });
-
-    res.json({ ok:true });
+    return res.json({ ok: true });
   } catch (err) {
-    console.error("Erreur /ingest:", err?.stack || err?.message || err);
-    res.status(500).json({ ok:false, error: err?.message || "server error" });
+    console.error("INGEST error:", err?.message || err);
+    return res.status(500).json({ ok:false, error: String(err?.message || err) });
   }
 });
 
-const port = process.env.PORT || 10000;
-app.listen(port, () => console.log(`relay up on ${port}`));
+/* =========================
+   Start
+========================= */
+app.listen(PORT, () => {
+  console.log(`▶ Service up on ${PORT}`);
+});
