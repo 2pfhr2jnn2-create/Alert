@@ -23,10 +23,11 @@ const tgBase = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const allowSet = new Set((ALLOW_CHAT_IDS || "").split(",").map(s => s.trim()).filter(Boolean));
 const seen = new Set();
 
-// ───────────────────────────────────────────────────────────────
-// HMAC
+/* ──────────────────────────────────────────────────────────────
+   HMAC: vérifie la signature du corps (si HMAC_SECRET défini)
+   ──────────────────────────────────────────────────────────── */
 function verifyHmac(req) {
-  if (!HMAC_SECRET) return true; // si vide → on laisse passer (utile pour tests)
+  if (!HMAC_SECRET) return true; // si vide → on accepte (utile en test)
   const sig = req.get("X-Signature") || "";
   const body = JSON.stringify(req.body || {});
   const h = crypto.createHmac("sha256", HMAC_SECRET).update(body).digest("hex");
@@ -34,10 +35,25 @@ function verifyHmac(req) {
   catch { return false; }
 }
 
-// ───────────────────────────────────────────────────────────────
-// Formatter tolérant aux variations Whale Alert
+/* ──────────────────────────────────────────────────────────────
+   Formatter Whale Alert (ultra tolérant + adresses si owner inconnu)
+   ──────────────────────────────────────────────────────────── */
 function formatWhaleAlert(payload) {
-  // 1) Retrouver un objet transaction, peu importe l’enrobage Pipedream
+  // util: raccourcir une adresse pour l’affichage
+  const short = (s) => {
+    if (!s) return "unknown";
+    const t = String(s);
+    return t.length > 16 ? `${t.slice(0, 6)}…${t.slice(-6)}` : t;
+  };
+  // util: préfère owner si renseigné (≠ "unknown"), sinon adresse
+  const pickOwner = (side) => {
+    const own = side?.owner;
+    if (own && String(own).toLowerCase() !== "unknown") return String(own);
+    if (side?.address) return short(side.address);
+    return "unknown";
+  };
+
+  // 1) Retrouver l’objet transaction, peu importe l’enrobage
   let root = payload && (payload.transaction || payload.payload || payload);
   if (root && root.exemples && Array.isArray(root.exemples)) root = root.exemples[0];
   else if (root && root.data && Array.isArray(root.data.transactions)) root = root.data.transactions[0];
@@ -54,12 +70,11 @@ function formatWhaleAlert(payload) {
   const ts = Number(base.timestamp || base.time || Date.now() / 1000);
   const dt = new Date(ts * 1000).toISOString();
 
-  // 3) Sous-transactions si déjà présentes
+  // 3) Sous-transactions si présentes
   let subs = Array.isArray(base.sub_transactions) ? base.sub_transactions : [];
 
   // 4) Sinon, reconstruire depuis symbol/amount/amount_usd + from/to
   if (!subs.length) {
-    // symboles possibles
     const symbol = (
       base.symbol ||
       base.currency ||
@@ -71,7 +86,6 @@ function formatWhaleAlert(payload) {
       ""
     ).toLowerCase();
 
-    // quantités possibles
     const amountRaw =
       base.amount ??
       base.quantity ??
@@ -82,7 +96,6 @@ function formatWhaleAlert(payload) {
       0;
     const amount = Number(amountRaw) || 0;
 
-    // valeur USD possibles
     const amountUsd = Number(
       base.amount_usd ??
       base.value_usd ??
@@ -91,28 +104,17 @@ function formatWhaleAlert(payload) {
       base.usd ??
       0
     );
-
     const unit_price_usd = amount ? amountUsd / amount : undefined;
 
-    // from/to : variantes fréquentes
+    // from/to : adresse si owner inconnu
     const fromOwner =
-      base.owner_from ||
-      base.from_owner ||
-      base.from_address ||
-      base.from?.owner ||
-      base.from?.address ||
-      base.inputs?.[0]?.owner ||
-      base.inputs?.[0]?.address ||
+      pickOwner(base.from) ||
+      pickOwner(base.inputs?.[0]) ||
       "unknown";
 
     const toOwner =
-      base.owner_to ||
-      base.to_owner ||
-      base.to_address ||
-      base.to?.owner ||
-      base.to?.address ||
-      base.outputs?.[0]?.owner ||
-      base.outputs?.[0]?.address ||
+      pickOwner(base.to) ||
+      pickOwner(base.outputs?.[0]) ||
       "unknown";
 
     if (symbol || amount) {
@@ -135,17 +137,19 @@ function formatWhaleAlert(payload) {
     0;
 
   const amountsLine = subs.length
-    ? subs.map(s => `${(s.symbol || "").toUpperCase()} ${s.amount ?? "?"}`).join(", ")
+    ? subs.map((s) => `${(s.symbol || "").toUpperCase()} ${s.amount ?? "?"}`).join(", ")
     : "?";
 
   const from =
     subs?.[0]?.inputs?.[0]?.owner ||
-    base.from?.owner || base.from_owner || base.from?.address ||
+    pickOwner(base.from) ||
+    pickOwner(base.inputs?.[0]) ||
     "unknown";
 
   const to =
     subs?.[0]?.outputs?.[0]?.owner ||
-    base.to?.owner || base.to_owner || base.to?.address ||
+    pickOwner(base.to) ||
+    pickOwner(base.outputs?.[0]) ||
     "unknown";
 
   const title = `🐋 Whale Alert`;
@@ -157,16 +161,15 @@ function formatWhaleAlert(payload) {
   return { title, body };
 }
 
-// ───────────────────────────────────────────────────────────────
-// Healthcheck GET
+/* ──────────────────────────────────────────────────────────────
+   Healthchecks
+   ──────────────────────────────────────────────────────────── */
 app.get("/", (_req, res) => res.send("OK"));
+app.get("/ingest", (_req, res) => res.send("Ingest OK — utilisez POST pour envoyer une alerte."));
 
-// GET lisible sur /ingest (pour rassurer en test)
-app.get("/ingest", (_req, res) => {
-  res.send("Ingest OK — utilisez POST pour envoyer une alerte.");
-});
-
-// Ingestion principale
+/* ──────────────────────────────────────────────────────────────
+   Ingestion principale
+   ──────────────────────────────────────────────────────────── */
 app.post("/ingest", async (req, res) => {
   try {
     if (DEBUG_LOG === "true") {
@@ -197,7 +200,7 @@ app.post("/ingest", async (req, res) => {
       msg = `${title}\n${body}`;
     }
 
-    // DEBUG_ECHO: renvoie un aperçu du payload brut dans Telegram (silencieux)
+    // DEBUG_ECHO: aperçu du payload brut dans Telegram (silencieux)
     if (DEBUG_ECHO === "true") {
       const preview = JSON.stringify(payload || {}).slice(0, 500);
       await axios.post(`${tgBase}/sendMessage`, {
@@ -208,7 +211,7 @@ app.post("/ingest", async (req, res) => {
       });
     }
 
-    // Envoi (silencieux si ABSOLUTE_SILENCE=true)
+    // Envoi du message formaté (silencieux si ABSOLUTE_SILENCE=true)
     await axios.post(`${tgBase}/sendMessage`, {
       chat_id: targetChat,
       text: msg,
