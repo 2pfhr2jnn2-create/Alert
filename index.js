@@ -163,7 +163,33 @@ function formatWhaleAlert(tx = {}) {
 
   return { title, body };
 }
+// Helper pour formater le digest quotidien joliment
+function formatDigestHTML(items = [], dateIso = new Date().toISOString()) {
+  const day = dateIso.slice(0, 10);
+  const header = `📊 <b>Digest quotidien — ${day}</b>\n`;
 
+  const top = [...items]
+    .sort((a,b) => (b.total_usd||0) - (a.total_usd||0))
+    .slice(0, 10);
+
+  const lines = top.map((x, i) => {
+    const name = x.entity || "Multiple Addresses";
+    const total = Math.round(x.total_usd||0).toLocaleString("en-US");
+    const txs = x.tx_count || 0;
+    const coins = (x.by_coin||[])
+      .sort((a,b)=>(b.total_usd||0)-(a.total_usd||0))
+      .slice(0,3)
+      .map(c => `${c.coin} ${Math.round(c.total_usd||0).toLocaleString("en-US")}`)
+      .join(" · ");
+    return `${i+1}) <b>${name}</b> — $${total} <i>(${txs} tx)</i>\n   └ ${coins}`;
+  });
+
+  if (!lines.length) {
+    return `${header}\n<i>Aucune alerte au-dessus des seuils aujourd’hui.</i>`;
+  }
+
+  return `${header}\n${lines.join("\n")}`;
+}
 /* =========================
    Routes
 ========================= */
@@ -200,9 +226,14 @@ app.post("/ingest", async (req, res) => {
       const { title, body } = formatWhaleAlert(payload || {});
       msg = `${title}\n${body}`;
     } else if (type === "digest") {
-      // texte déjà formaté côté Pipedream
-      msg = escapeHtml(text || "Digest");
-    } else {
+  // Si le message contient déjà du HTML prêt, on l'utilise.
+  const { html, items, date } = req.body || {};
+  if (html) {
+    msg = String(html);
+  } else {
+    msg = formatDigestHTML(items || [], date || new Date().toISOString());
+  }
+} else {
       msg = escapeHtml(text || "Nouvelle alerte.");
     }
 
