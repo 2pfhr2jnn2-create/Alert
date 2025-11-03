@@ -38,68 +38,31 @@ const short = s => (!s ? "unknown" : String(s).length > 16 ? `${String(s).slice(
 const niceN = (n, maxFrac=6) => Number(n ?? 0).toLocaleString("en-US", { maximumFractionDigits: maxFrac });
 
 // formatter whale alert
-function formatWhaleAlert(payload) {
-  const pickOwner = (side) => {
-    if (!side) return "unknown";
-    const own = side.owner || side.owner_type;
-    if (own && String(own).toLowerCase() !== "unknown") return String(own);
-    if (side.address) return short(side.address);
-    return "unknown";
+function formatWhaleAlert(tx) {
+  const safe = (s) => (!s ? "unknown" :
+    s.length > 16 ? `${s.slice(0,6)}…${s.slice(-6)}` : s);
+
+  const pick = (side={}) => {
+    if (side.owner && side.owner.toLowerCase() !== "unknown") return side.owner;
+    const cands = [
+      side.address, side.addr, side.account,
+      side?.inputs?.[0]?.address,
+      side?.outputs?.[0]?.address,
+    ].filter(Boolean);
+    return cands.length ? safe(cands[0]) : "unknown";
   };
 
-  let root = payload && (payload.transaction || payload.payload || payload);
-  if (root && root.exemples && Array.isArray(root.exemples)) root = root.exemples[0];
-  else if (root && root.data && Array.isArray(root.data.transactions)) root = root.data.transactions[0];
-  else if (root && root.transactions && Array.isArray(root.transactions)) root = root.transactions[0];
-  const base = Array.isArray(root) ? (root[0] || {}) : (root || {});
+  const from = pick(tx.from);
+  const to = pick(tx.to);
+  const coin = (tx.symbol || tx.currency || "?").toUpperCase();
+  const amount = Number(tx.amount_usd || tx.value_usd || 0);
+  const value = amount ? `$${Math.round(amount).toLocaleString()}` : "?";
 
-  const chain =
-    base.blockchain || base.network ||
-    (base.currency && base.currency.blockchain) || "unknown";
-
-  const ts = Number(base.timestamp || base.time || Date.now()/1000);
-  const dt = new Date(ts * 1000).toISOString();
-
-  let subs = Array.isArray(base.sub_transactions) ? base.sub_transactions : [];
-  if (!subs.length) {
-    const symbol = (base.symbol || base.currency || base.coin || base.asset || base.ticker || "").toUpperCase();
-    const amount = Number(base.amount ?? base.quantity ?? base.volume ?? base.size ??
-                 (Array.isArray(base.amounts) && base.amounts[0]?.amount) ?? 0);
-    const valueUSD = Number(base.amount_usd ?? base.value_usd ?? base.usd_value ?? base.fiat_value_usd ?? base.usd ?? 0);
-    const fromOwner = (base.from && (base.from.owner || base.from.address)) ? (base.from.owner || short(base.from.address)) : "unknown";
-    const toOwner   = (base.to   && (base.to.owner   || base.to.address))   ? (base.to.owner   || short(base.to.address))   : "unknown";
-    if (symbol || amount) {
-      const unit_price_usd = amount ? (valueUSD / amount) : undefined;
-      subs = [{ symbol, amount, unit_price_usd, inputs:[{ owner: fromOwner }], outputs:[{ owner: toOwner }] }];
-    }
-  }
-
-  const valueUSD =
-    subs.reduce((acc, s) => acc + (Number(s.unit_price_usd || 0) * Number(s.amount || 0)), 0) ||
-    Number(base.amount_usd || base.value_usd || 0) || 0;
-
-  const amountsLine = subs.length
-    ? subs.map(s => `${(s.symbol || "").toUpperCase()} ${niceN(s.amount)}`).join(", ")
-    : "?";
-
-  const from =
-    subs?.[0]?.inputs?.[0]?.owner ||
-    (base.from && (base.from.owner || short(base.from.address))) || "unknown";
-
-  const to =
-    subs?.[0]?.outputs?.[0]?.owner ||
-    (base.to && (base.to.owner || short(base.to.address))) || "unknown";
-
-  const title = `🐋 Whale Alert`;
-  const body = `• Réseau: ${chain}
-• De → À: ${from} → ${to}
-• Montants: ${amountsLine}
-• Valeur ~$${valueUSD ? Math.round(valueUSD).toLocaleString("en-US") : "?"}
-• Date: ${dt}`;
-
-  return { title, body };
+  return {
+    title: "🐋 Whale Alert",
+    body: `• Coin: ${coin}\n• From → To: ${from} → ${to}\n• Value: ${value}`,
+  };
 }
-
 // healthchecks
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/ingest", (_req, res) => res.send("Ingest OK — utilisez POST pour envoyer une alerte."));
