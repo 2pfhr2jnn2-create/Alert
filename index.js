@@ -15,15 +15,15 @@ const {
   ABSOLUTE_SILENCE = "true",
   HMAC_SECRET,
   ALLOW_CHAT_IDS,
-  DEBUG_LOG,
-  DEBUG_ECHO,
+  DEBUG_LOG = "false",
+  DEBUG_ECHO = "false",
 } = process.env;
 
 const tgBase = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const allowSet = new Set((ALLOW_CHAT_IDS || "").split(",").map(s => s.trim()).filter(Boolean));
 const seen = new Set();
 
-/* Vérification HMAC (sécurité API) */
+// HMAC
 function verifyHmac(req) {
   if (!HMAC_SECRET) return true;
   const sig = req.get("X-Signature") || "";
@@ -33,16 +33,12 @@ function verifyHmac(req) {
   catch { return false; }
 }
 
-/* ==========================================================
-   FORMATTER DES ALERTES WHALE ALERT + ADRESSES SI UNKNOWN
-   ========================================================== */
-function formatWhaleAlert(payload) {
-  const short = (s) => {
-    if (!s) return "unknown";
-    const t = String(s);
-    return t.length > 16 ? `${t.slice(0, 6)}…${t.slice(-6)}` : t;
-  };
+// utils
+const short = s => (!s ? "unknown" : String(s).length > 16 ? `${String(s).slice(0,6)}…${String(s).slice(-6)}` : String(s));
+const niceN = (n, maxFrac=6) => Number(n ?? 0).toLocaleString("en-US", { maximumFractionDigits: maxFrac });
 
+// formatter whale alert
+function formatWhaleAlert(payload) {
   const pickOwner = (side) => {
     if (!side) return "unknown";
     const own = side.owner || side.owner_type;
@@ -52,77 +48,88 @@ function formatWhaleAlert(payload) {
   };
 
   let root = payload && (payload.transaction || payload.payload || payload);
-  if (root && root.data && Array.isArray(root.data.transactions)) root = root.data.transactions[0];
-  else if (root && Array.isArray(root.transactions)) root = root.transactions[0];
+  if (root && root.exemples && Array.isArray(root.exemples)) root = root.exemples[0];
+  else if (root && root.data && Array.isArray(root.data.transactions)) root = root.data.transactions[0];
+  else if (root && root.transactions && Array.isArray(root.transactions)) root = root.transactions[0];
   const base = Array.isArray(root) ? (root[0] || {}) : (root || {});
 
-  const chain = base.blockchain || base.network || "unknown";
-  const ts = Number(base.timestamp || base.time || Date.now() / 1000);
+  const chain =
+    base.blockchain || base.network ||
+    (base.currency && base.currency.blockchain) || "unknown";
+
+  const ts = Number(base.timestamp || base.time || Date.now()/1000);
   const dt = new Date(ts * 1000).toISOString();
 
-  const symbol = (base.symbol || base.currency || "").toUpperCase();
-  const amount = Number(base.amount || base.amounts?.[0]?.amount || 0);
-  const valueUSD = Number(base.amount_usd || base.value_usd || 0);
+  let subs = Array.isArray(base.sub_transactions) ? base.sub_transactions : [];
+  if (!subs.length) {
+    const symbol = (base.symbol || base.currency || base.coin || base.asset || base.ticker || "").toUpperCase();
+    const amount = Number(base.amount ?? base.quantity ?? base.volume ?? base.size ??
+                 (Array.isArray(base.amounts) && base.amounts[0]?.amount) ?? 0);
+    const valueUSD = Number(base.amount_usd ?? base.value_usd ?? base.usd_value ?? base.fiat_value_usd ?? base.usd ?? 0);
+    const fromOwner = (base.from && (base.from.owner || base.from.address)) ? (base.from.owner || short(base.from.address)) : "unknown";
+    const toOwner   = (base.to   && (base.to.owner   || base.to.address))   ? (base.to.owner   || short(base.to.address))   : "unknown";
+    if (symbol || amount) {
+      const unit_price_usd = amount ? (valueUSD / amount) : undefined;
+      subs = [{ symbol, amount, unit_price_usd, inputs:[{ owner: fromOwner }], outputs:[{ owner: toOwner }] }];
+    }
+  }
+
+  const valueUSD =
+    subs.reduce((acc, s) => acc + (Number(s.unit_price_usd || 0) * Number(s.amount || 0)), 0) ||
+    Number(base.amount_usd || base.value_usd || 0) || 0;
+
+  const amountsLine = subs.length
+    ? subs.map(s => `${(s.symbol || "").toUpperCase()} ${niceN(s.amount)}`).join(", ")
+    : "?";
 
   const from =
-    pickOwner(base.from) ||
-    pickOwner(base.inputs?.[0]) ||
-    "unknown";
+    subs?.[0]?.inputs?.[0]?.owner ||
+    (base.from && (base.from.owner || short(base.from.address))) || "unknown";
 
   const to =
-    pickOwner(base.to) ||
-    pickOwner(base.outputs?.[0]) ||
-    "unknown";
+    subs?.[0]?.outputs?.[0]?.owner ||
+    (base.to && (base.to.owner || short(base.to.address))) || "unknown";
 
   const title = `🐋 Whale Alert`;
   const body = `• Réseau: ${chain}
 • De → À: ${from} → ${to}
-• Montants: ${symbol} ${amount.toLocaleString("en-US")}
+• Montants: ${amountsLine}
 • Valeur ~$${valueUSD ? Math.round(valueUSD).toLocaleString("en-US") : "?"}
 • Date: ${dt}`;
 
   return { title, body };
 }
 
-/* ==========================================================
-   HEALTHCHECKS (Render ping)
-   ========================================================== */
+// healthchecks
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/ingest", (_req, res) => res.send("Ingest OK — utilisez POST pour envoyer une alerte."));
 
-/* ==========================================================
-   INGEST PRINCIPAL
-   ========================================================== */
+// ingestion
 app.post("/ingest", async (req, res) => {
   try {
-    if (DEBUG_LOG === "true") {
-      console.log("INGEST BODY:", JSON.stringify(req.body).slice(0, 800));
-    }
+    if (DEBUG_LOG === "true") console.log("INGEST BODY:", JSON.stringify(req.body).slice(0,800));
+    if (!verifyHmac(req)) return res.status(401).json({ ok:false, error:"bad signature" });
 
-    if (!verifyHmac(req)) {
-      return res.status(401).json({ ok: false, error: "bad signature" });
-    }
+    const { type = "whale", chat_id, idempotency_key, payload, text } = req.body || {};
 
-    const { type = "whale", chat_id, idempotency_key, payload } = req.body || {};
-
+    // anti-dup 5 min
     const key = idempotency_key || crypto.createHash("md5").update(JSON.stringify(req.body)).digest("hex");
-    if (seen.has(key)) return res.json({ ok: true, dedup: true });
-    seen.add(key);
-    setTimeout(() => seen.delete(key), 5 * 60 * 1000);
+    if (seen.has(key)) return res.json({ ok:true, dedup:true });
+    seen.add(key); setTimeout(() => seen.delete(key), 5*60*1000);
 
     const targetChat = String(chat_id || DEFAULT_CHAT_ID || "");
-    if (!targetChat) return res.status(400).json({ ok: false, error: "missing chat id" });
-    if (allowSet.size && !allowSet.has(targetChat)) {
-      return res.status(403).json({ ok: false, error: "chat not allowed" });
-    }
+    if (!targetChat) return res.status(400).json({ ok:false, error:"missing chat id" });
+    if (allowSet.size && !allowSet.has(targetChat)) return res.status(403).json({ ok:false, error:"chat not allowed" });
 
     let msg = "Nouvelle alerte.";
     if (type === "whale") {
       const { title, body } = formatWhaleAlert(payload || {});
       msg = `${title}\n${body}`;
+    } else if (type === "digest") {
+      // message déjà formatté côté Pipedream (texte libre)
+      msg = text || "Résumé quotidien";
     }
 
-    // Affiche le payload brut pour debug
     if (DEBUG_ECHO === "true") {
       const preview = JSON.stringify(payload || {}, null, 2).slice(0, 700);
       await axios.post(`${tgBase}/sendMessage`, {
@@ -133,7 +140,6 @@ app.post("/ingest", async (req, res) => {
       });
     }
 
-    // Envoi du message formaté
     await axios.post(`${tgBase}/sendMessage`, {
       chat_id: targetChat,
       text: msg,
@@ -142,10 +148,10 @@ app.post("/ingest", async (req, res) => {
       disable_notification: String(ABSOLUTE_SILENCE).toLowerCase() === "true",
     });
 
-    res.json({ ok: true });
+    res.json({ ok:true });
   } catch (err) {
     console.error("Erreur /ingest:", err?.stack || err?.message || err);
-    res.status(500).json({ ok: false, error: err?.message || "server error" });
+    res.status(500).json({ ok:false, error: err?.message || "server error" });
   }
 });
 
